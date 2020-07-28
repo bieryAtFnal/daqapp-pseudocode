@@ -28,9 +28,9 @@ namespace fakehlf {
 FakeHLF_PseudoCode::FakeHLF_PseudoCode(const std::string& name)
   : DAQModule(name)
   , thread_(std::bind(&FakeHLF_PseudoCode::do_work, this, std::placeholders::_1))
-  , requestChannel_(nullptr)
-  , dataSource_(nullptr)
-  , resultSink_(nullptr)
+  , requestSender_(nullptr)
+  , dataReceiver_(nullptr)
+  , resultSender_(nullptr)
   , requestSendTimeout_(100)
   , dataReceiveTimeout_(100)
   , resultSendTimeout_(100)
@@ -42,39 +42,32 @@ FakeHLF_PseudoCode::FakeHLF_PseudoCode(const std::string& name)
 void
 FakeHLF_PseudoCode::init()
 {
-
-  // 02-Jun-2020, KAB: the way that I've written this code implies that the
-  // QueueRegistry evolves into some sort of more general inter-connection registry *and*
-  // we can ask it to return named network connections as well as named queues.
-  // Question 1: is this what we want?
-  // Question 2: can all types of network connections be created 'whenever'?
-
   TLOG(TLVL_ENTER_EXIT_METHODS) << get_name() << ": Entering init() method";
   try
   {
-    requestChannel_.reset(new dunedaq::appfwk::DAQSink<TriggerRecordRequest>(get_config()["request_channel_name"].get<std::string>()));
+    requestSender_.reset(new dunedaq::msglib::DAQSender<TriggerRecordRequest>(get_config()["request_address"].get<std::string>()));
   }
   catch (const ers::Issue& excpt)
   {
-    throw InvalidEndpointFatalError(ERS_HERE, get_name(), "request channel", excpt);
+    throw InvalidEndpointFatalError(ERS_HERE, get_name(), "request connection", excpt);
   }
 
   try
   {
-    dataSource_.reset(new dunedaq::appfwk::DAQSource<TriggerRecord>(get_config()["data_source_name"].get<std::string>()));
+    dataReceiver_.reset(new dunedaq::msglib::DAQReceiver<TriggerRecord>(get_config()["data_source_address"].get<std::string>()));
   }
   catch (const ers::Issue& excpt)
   {
-    throw InvalidEndpointFatalError(ERS_HERE, get_name(), "data source", excpt);
+    throw InvalidEndpointFatalError(ERS_HERE, get_name(), "data source address", excpt);
   }
 
   try
   {
-    resultSink_.reset(new dunedaq::appfwk::DAQSink<TriggerRecord>(get_config()["result_sink_name"].get<std::string>()));
+    resultSender_.reset(new dunedaq::msglib::DAQSender<TriggerRecord>(get_config()["result_destination_address"].get<std::string>()));
   }
   catch (const ers::Issue& excpt)
   {
-    throw InvalidEndpointFatalError(ERS_HERE, get_name(), "result sink", excpt);
+    throw InvalidEndpointFatalError(ERS_HERE, get_name(), "result destination address", excpt);
   }
 
   TLOG(TLVL_ENTER_EXIT_METHODS) << get_name() << ": Exiting init() method";
@@ -105,16 +98,17 @@ FakeHLF_PseudoCode::do_work(std::atomic<bool>& running_flag)
   const int TRsToRequestEachTime = 1;
   int requestCount = 0;
   int requestedTRCount = 0;
-  int receivedcount = 0;
+  int receivedCount = 0;
   int sentCount = 0;
 
   while (running_flag.load()) {
     TLOG(TLVL_WORK_PROGRESS) << get_name() << ": Sending a request for another Trigger Record";
 
     // *** Create the request message
-    TriggerRecordRequest trReq;
+    TriggerRecordRequest trReq = MessageFactory::create("TriggerRecordRequest");
+
     // how should we specify "my address"?
-    trReq.setMyAddress(get_config()["data_source_name"].get<std::string>());
+    trReq.setMyAddress(get_config()["data_source_address"].get<std::string>());
     // we don't need to go into details on specifying the acceptable TR types now
     trReq.setAcceptableTRTypes(bitmaskOrStructureOrList);
     trReq.setNumberOfRecordsToSend(TRsToRequestEachTime);
@@ -122,14 +116,14 @@ FakeHLF_PseudoCode::do_work(std::atomic<bool>& running_flag)
     // *** Send the message to the Dispatcher
     try
     {
-      requestChannel_->push(trReq, queueTimeout_);
+      requestSender_->send(trReq, requestSendTimeout_);
     }
-    catch (const dunedaq::appfwk::QueueTimeoutExpired& excpt)
+    catch (const dunedaq::msglib::TransportTimeoutExpired& excpt)
     {
       std::ostringstream oss_warn;
-      oss_warn << "push to request channel \"" << requestChannel_->get_name() << "\"";
-      ers::warning(dunedaq::appfwk::QueueTimeoutExpired(ERS_HERE, get_name(), oss_warn.str(),
-                   std::chrono::duration_cast<std::chrono::milliseconds>(queueTimeout_).count()));
+      oss_warn << "send to request address \"" << requestSender_->get_name() << "\"";
+      ers::warning(dunedaq::msglib::TransportTimeoutExpired(ERS_HERE, get_name(), oss_warn.str(),
+                   std::chrono::duration_cast<std::chrono::milliseconds>(requestSendTimeout_).count()));
       continue;
     }
 
@@ -150,36 +144,39 @@ FakeHLF_PseudoCode::do_work(std::atomic<bool>& running_flag)
         TLOG(TLVL_LIST_VALIDATION) << get_name() << ": Receiving the next Trigger Record";
         try
         {
-          dataSource_->pop(trigRec, queueTimeout_);
+          dataReceiver_->receive(trigRec, dataReceiveTimeout_);
           trigRecWasSuccessfullyReceived = true;
           --trigRecLeftToReceive;
         }
-        catch (const dunedaq::appfwk::QueueTimeoutExpired& excpt)
+        catch (const dunedaq::msglib::TransportTimeoutExpired& excpt)
         {
           // only print out a gentle warning after a while.
           // It's OK that data doesn't arrive promptly (maybe the current trigger rate is very low),
           // but it's probably good to let someone know that we're waiting for data after a while.
           std::ostringstream oss_warn;
-          oss_warn << "pop from data source";
-          ers::warning(dunedaq::appfwk::QueueTimeoutExpired(ERS_HERE, get_name(), oss_warn.str(),
-                       std::chrono::duration_cast<std::chrono::milliseconds>(queueTimeout_).count()));
+          oss_warn << "receive from data source";
+          ers::warning(dunedaq::msglib::TransportTimeoutExpired(ERS_HERE, get_name(), oss_warn.str(),
+                       std::chrono::duration_cast<std::chrono::milliseconds>(dataReceiveTimeout_).count()));
         }
       }
 
       if (trigRecWasSuccessfullyReceived)
       {
+        ++receivedCount;
+
         // process the data in some way.
-        // For now, I'll just copy the data from the input to the output.
+        // For now, we'll just send the same data back.
         bool trigRecWasSuccessfullySent = false;
         while (!trigRecWasSuccessfullySent && running_flag.load())
         {
           TLOG(TLVL_LIST_VALIDATION) << get_name() << ": Sending the processed Trigger Record back to the Dispatcher";
           try
           {
-            resultSink_->push(trigRec, queueTimeout_);
+            resultSender_->send(trigRec, resultSendTimeout_);
             trigRecWasSuccessfullySent = true;
+            ++sentCount;
           }
-          catch (const dunedaq::appfwk::QueueTimeoutExpired& excpt)
+          catch (const dunedaq::msglib::TransportTimeoutExpired& excpt)
           {
             // Complain loudly if we can't send the result to the Dispatcher.
             // We'll need to decide whether to retry forever, or go onto the next input TR.
